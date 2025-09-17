@@ -248,10 +248,11 @@ for my $proj (@$project_dirs) {
 }
 
 # 3) Служебные папки (level 2) под выросшими проектами
-my @service_dirs_all;
+my $service_dirs_all;   # объявляем тут один раз
+
 if ($FIRST_RUN) {
     # на первом запуске — берём ВСЕ служебные папки под ВСЕМИ проектами
-    $service_dirs_all = list_dirs_at_level(\@{$project_dirs}, $SERVICE_LEVEL);
+    $service_dirs_all = list_dirs_at_level($project_dirs, $SERVICE_LEVEL);
 } else {
     my @grown_proj_paths = map { $_->[0] } @grown_projects;
     $service_dirs_all = list_dirs_at_level(\@grown_proj_paths, $SERVICE_LEVEL);
