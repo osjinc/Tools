@@ -47,7 +47,8 @@
 
 ## Требования
 
-Linux / Unix-подобная система.
+Linux / Unix-подобная система
 Perl 5.x.
-Доступный sendmail для отправки писем.
-Утилита find (GNU findutils).
+Доступный sendmail для отправки писем
+Утилита find (GNU findutils)
+
