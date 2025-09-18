@@ -1,6 +1,7 @@
 #!/usr/bin/env perl
 # monitor_large_nfs_find.pl
-# NFS-friendly: без du; поиск ТОЛЬКО больших файлов + кэш известных, "только новые/рост".
+# NFS-friendly: без du; поиск ТОЛЬКО больших файлов + кэш известных (NEW/GROWTH)
+# Дополнительно (опционально): TOP-N "жирных" директорий по сумме размеров файлов.
 use strict;
 use warnings;
 use Fcntl qw(:flock :DEFAULT);
@@ -19,17 +20,24 @@ my $THRESHOLD_BYTES = 2 * 1024 * 1024 * 1024;  # 2 GiB
 # Повторно уведомлять, если рост ≥ столько (1 = любое увеличение)
 my $MIN_FILE_GROWTH_BYTES = 1;
 
-# Ограничение поиска (важно для NFS)
+# Ограничение области поиска (важно для NFS)
 my $MAX_DEPTH         = 4;     # глубина обхода (0=только корень, 1=дети, …)
 my $FOLLOW_SYMLINKS   = 0;     # 0 — не следовать симлинкам (безопаснее на NFS)
-my $XDEV              = 0;     # 1 — не пересекать другие файловые системы (обычно для локальных, на NFS часто 0)
+my $XDEV              = 0;     # 1 — не пересекать другие FS (обычно для локальных, на NFS часто 0)
 
-# Исключения (паттерны путей для -prune). Регэксп Perl, применяется к абсолютному пути.
+# Исключения (регэкспы Perl, применяются к абсолютному пути)
 my @EXCLUDE_DIR_PATTERNS = (
     qr{/\.(git|svn|hg)(/|$)},
     qr{/tmp(/|$)},
     # qr{/data/old_backups(/|$)},
 );
+
+# ===== TOP жирных директорий (опционально) =====
+my $DIR_TALLY_ENABLE      = 1;                 # 1 = включить сбор топ папок
+my $DIR_TALLY_MAX_DEPTH   = 4;                 # глубина для подсчёта папок (обычно = $MAX_DEPTH)
+my $DIR_TALLY_FILE_LIMIT  = 250000;            # защитный лимит кол-ва учтённых файлов (на запуск)
+my $DIR_TALLY_TOP_N       = 20;                # показать ТОП N папок
+my $DIR_TALLY_MIN_BYTES   = 10 * 1024 * 1024 * 1024;  # минимальный размер папки для отчёта (10 GiB)
 
 # Email
 my $RECIPIENTS     = 'ops@example.com';
@@ -85,7 +93,6 @@ sub save_file_index {
 }
 sub file_key { my($dev,$ino)=@_; return "$dev:$ino" }
 
-# Фильтр по исключениям директорий
 sub path_is_excluded {
     my ($path)=@_;
     for my $re (@EXCLUDE_DIR_PATTERNS) {
@@ -94,43 +101,26 @@ sub path_is_excluded {
     return 0;
 }
 
-# Поиск больших файлов: легковесный GNU find (только метаданные)
-# Возвращает массив хэшей: { path, size, mtime, ctime, dev, ino }
+# ---------- Поиск больших файлов (GNU find) ----------
+# Возвращает [{ path, size, mtime, ctime, dev, ino }, ...]
 sub find_large_files {
     my ($roots_ref, $threshold, $maxdepth)=@_;
     my @roots = @$roots_ref;
     my @found;
 
-    my $size_arg = $threshold . 'c';  # байты
-    my $depth_arg = defined $maxdepth ? "-maxdepth $maxdepth" : "";
+    my @common;
+    push @common, ('-xdev') if $XDEV;
+    push @common, ('-maxdepth', $maxdepth) if defined $maxdepth;
+    push @common, ('-ignore_readdir_race');
 
-    # Строим команду find для каждого корня, применяя исключения как -path ... -prune
     for my $root (@roots) {
         next unless -d $root;
 
-        # Соберём часть для -prune
-        my @prunes;
-        for my $re (@EXCLUDE_DIR_PATTERNS) {
-            # переводим регэксп в простую подстроку, если получилось — иначе пропустим в шелл-части
-            # лучше всего задать исключения сразу строками путей выше в конфиге
-        }
+        my @cmd = ('find');
+        push @cmd, $FOLLOW_SYMLINKS ? ('-L') : ();  # следовать симлинкам? обычно нет
+        push @cmd, ($root, @common, '-type', 'f', '-size', '+'.($threshold.'c'),
+                    '-printf', '%s\t%T@\t%C@\t%p\0');
 
-        # Базовая команда (GNU find)
-        # -ignore_readdir_race уменьшает ворнинги;
-        # -type f -size +Nc — только файлы больше порога
-        # -printf — выводим размер, mtime(sec), ctime(sec) и путь
-        my @cmd = ('find', $root);
-        push @cmd, ('-xdev') if $XDEV;
-        push @cmd, (split(/\s+/, $depth_arg)) if $depth_arg;
-
-        # Применим -prune к исключениям (в виде нескольких -path '...' -prune -o …)
-        # Упростим: будем пропускать исключения на стороне Perl (быстрее и гибче),
-        # а find просто найдёт кандидатов.
-
-        push @cmd, ('-ignore_readdir_race', '-type', 'f', '-size', '+'.$size_arg,
-                    '-printf', '%s\t%T@\t%C@\t%p\0');  # NUL-разделитель путей
-
-        # Выполняем
         my $pid = open(my $fh, "-|", @cmd);
         if (!$pid) { warn "Cannot run find @cmd: $!"; next; }
 
@@ -140,8 +130,7 @@ sub find_large_files {
             my ($sz,$mt,$ct,$path) = split(/\t/, $rec, 4);
             next unless defined $path;
             next if path_is_excluded($path);
-            # stat для dev/ino (можно взять и из lstat)
-            my @st = lstat($path);
+            my @st = lstat($path);  # для dev/ino
             next unless @st;
             my ($dev,$ino) = @st[0,1];
             push @found, {
@@ -155,11 +144,56 @@ sub find_large_files {
         }
         close $fh;
     }
-
     return \@found;
 }
 
-# Письмо
+# ---------- Подсчёт "жирных" директорий (сумма файлов) ----------
+# ВНИМАНИЕ: это всё равно проход по файлам (как find), но с ограничениями.
+# Возвращает массив пар [dir_path, total_bytes], отсортированный по убыванию.
+sub tally_large_dirs {
+    my ($roots_ref, $maxdepth, $file_limit)=@_;
+    my @roots = @$roots_ref;
+    my %sum;
+    my $count = 0;
+
+    my @common;
+    push @common, ('-xdev') if $XDEV;
+    push @common, ('-maxdepth', $maxdepth) if defined $maxdepth;
+    push @common, ('-ignore_readdir_race');
+
+    ROOT: for my $root (@roots) {
+        next unless -d $root;
+        my @cmd = ('find');
+        push @cmd, $FOLLOW_SYMLINKS ? ('-L') : ();
+        push @cmd, ($root, @common, '-type', 'f', '-printf', '%s\t%h\0'); # размер и директория файла
+
+        my $pid = open(my $fh, "-|", @cmd);
+        if (!$pid) { warn "Cannot run find @cmd: $!"; next; }
+
+        local $/ = "\0";
+        while (defined(my $rec = <$fh>)) {
+            chomp $rec;
+            my ($sz, $dir) = split(/\t/, $rec, 2);
+            next unless defined $dir && defined $sz;
+            next if path_is_excluded($dir);
+            $sum{$dir} += int($sz);
+
+            $count++;
+            if ($file_limit && $count >= $file_limit) {
+                # Прерываем аккуратно
+                close $fh;
+                last ROOT;
+            }
+        }
+        close $fh;
+    }
+
+    my @pairs = map { [$_, $sum{$_}] } keys %sum;
+    @pairs = sort { $b->[1] <=> $a->[1] } @pairs;
+    return \@pairs;
+}
+
+# ---------- Письмо ----------
 sub build_email_message {
     my (%a)=@_;
     my ($from,$to,$subj,$body,$date)=@a{qw/from to_csv subject body_text date_header/};
@@ -171,13 +205,13 @@ sub preview_print { my($t,$err)=@_; my $io=$err?*STDERR:*STDOUT; print $io "====
 # ===================== MAIN =====================
 ensure_state_dir($STATE_DIR);
 my $hostname = do{ my $h=`hostname`; chomp $h; $h; };
-my $utc_now  = strftime("%Y-%m-%d %H:%M:%S %Z", localtime(time));
+my $utc_now  = strftime("%Y-%m-%d %H:%M:%S %Z", gmtime(time));
 
-# 1) Перечитываем кэш
+# 1) Кэш известных крупных файлов
 my $idx_ref = load_file_index($STATE_FILE_INDEX); my %idx=%$idx_ref;
 
-# 2) Проверяем уже известные крупные файлы (дёшево для NFS)
-my @events;   # {path,size,mtime,ctime,prev_size?,delta?,kind}
+# 2) Проверка известных (дёшево для NFS)
+my @events;   # {path,size,mtime,ctime,prev_size?,delta?,kind,dev,ino}
 my %seen_keys;
 for my $k (keys %idx) {
     my $info = $idx{$k};
@@ -194,10 +228,10 @@ for my $k (keys %idx) {
     }
 }
 
-# 3) Лёгкое обнаружение новых крупных файлов (ограниченная область поиска)
+# 3) Поиск новых больших файлов (ограниченной глубиной)
 my $found = find_large_files(\@ROOT_DIRS, $THRESHOLD_BYTES, $MAX_DEPTH);
 
-# 4) Отфильтровать только "NEW" (по dev:ino) и добавить "GROWTH" если нужно
+# 4) NEW / GROWTH для найденных
 for my $h (@$found) {
     my $k = file_key($h->{dev}, $h->{ino});
     next if $seen_keys{$k};          # уже проверили как известный
@@ -212,29 +246,61 @@ for my $h (@$found) {
     }
 }
 
-# 5) Если событий нет — выходим тихо
-exit 0 unless @events;
+# 5) (опционально) TOP жирных директорий
+my $top_dirs = [];
+if ($DIR_TALLY_ENABLE) {
+    my $pairs = tally_large_dirs(\@ROOT_DIRS, $DIR_TALLY_MAX_DEPTH, $DIR_TALLY_FILE_LIMIT);
+    # Отфильтруем по минимальному размеру папки
+    my @flt = grep { $_->[1] >= $DIR_TALLY_MIN_BYTES } @$pairs;
+    # Возьмём TOP-N
+    if (@flt) {
+        @flt = @flt[0 .. ($DIR_TALLY_TOP_N-1)] if @flt > $DIR_TALLY_TOP_N;
+        $top_dirs = \@flt;
+    }
+}
 
-# 6) Письмо
+# Если нет событий и нет топ-папок — выходим тихо
+if (!@events && (!@$top_dirs)) {
+    exit 0;
+}
+
+# 6) Сформировать письмо
 my $body = "";
 $body .= "Large files on NFS (find-only, no du)\n";
 $body .= "Time      : $utc_now\n";
 $body .= "Host      : $hostname\n";
 $body .= "Threshold : ".human_size($THRESHOLD_BYTES)." ($THRESHOLD_BYTES bytes)\n";
-$body .= "MaxDepth  : $MAX_DEPTH  (search bounds)\n\n";
-$body .= "EVENTS (NEW/GROWTH ≥ ".human_size($MIN_FILE_GROWTH_BYTES)."):\n";
+$body .= "MaxDepth  : $MAX_DEPTH  (file search)\n";
+if ($DIR_TALLY_ENABLE) {
+    $body .= "DirTally  : depth=$DIR_TALLY_MAX_DEPTH, file_limit=$DIR_TALLY_FILE_LIMIT, min=".human_size($DIR_TALLY_MIN_BYTES)."\n";
+}
+$body .= "\n";
 
-for my $e (@events) {
-    my $hr = human_size($e->{size});
-    my $delta_hr = defined $e->{delta} ? human_size($e->{delta}) : 'n/a';
-    my $prev_hr  = defined $e->{prev_size} ? human_size($e->{prev_size}) : 'n/a';
-    $body .= "[$e->{kind}] $e->{path}\n";
-    $body .= "  Size     : $hr ($e->{size} bytes)\n";
-    $body .= "  PrevSize : $prev_hr"; $body .= defined $e->{prev_size} ? " ($e->{prev_size} bytes)\n" : "\n";
-    $body .= "  Δ         : $delta_hr"; $body .= defined $e->{delta} ? " ($e->{delta} bytes)\n" : "\n";
-    $body .= "  Modified : ".format_time($e->{mtime})."\n";
-    $body .= "  CTime    : ".format_time($e->{ctime})."\n";
-    $body .= "----------------------------------------\n";
+if (@events) {
+    $body .= "EVENTS (NEW/GROWTH ≥ ".human_size($MIN_FILE_GROWTH_BYTES)."):\n";
+    for my $e (@events) {
+        my $hr = human_size($e->{size});
+        my $delta_hr = defined $e->{delta} ? human_size($e->{delta}) : 'n/a';
+        my $prev_hr  = defined $e->{prev_size} ? human_size($e->{prev_size}) : 'n/a';
+        $body .= "[$e->{kind}] $e->{path}\n";
+        $body .= "  Size     : $hr ($e->{size} bytes)\n";
+        $body .= "  PrevSize : $prev_hr"; $body .= defined $e->{prev_size} ? " ($e->{prev_size} bytes)\n" : "\n";
+        $body .= "  Δ         : $delta_hr"; $body .= defined $e->{delta} ? " ($e->{delta} bytes)\n" : "\n";
+        $body .= "  Modified : ".format_time($e->{mtime})."\n";
+        $body .= "  CTime    : ".format_time($e->{ctime})."\n";
+        $body .= "----------------------------------------\n";
+    }
+    $body .= "\n";
+}
+
+if (@$top_dirs) {
+    $body .= "TOP DIRECTORIES (>= ".human_size($DIR_TALLY_MIN_BYTES)."):\n";
+    my $rank = 1;
+    for my $pd (@$top_dirs) {
+        my ($dir,$bytes) = @$pd;
+        $body .= sprintf("  %2d) %s  %s (%d bytes)\n", $rank++, $dir, human_size($bytes), $bytes);
+    }
+    $body .= "\n";
 }
 
 my $subject  = "$SUBJECT_PREFIX on $hostname";
