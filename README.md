@@ -44,11 +44,14 @@
 ```cron
 */5 * * * * /usr/bin/perl /usr/local/bin/monitor_large_newonly.pl
 ```
-
 ## Требования
 
-Linux / Unix-подобная система
-Perl 5.x.
-Доступный sendmail для отправки писем
-Утилита find (GNU findutils)
+- Linux / Unix-подобная система  
+- Perl 5.x  
+- Доступный `sendmail` для отправки писем  
+- Утилита `find` (GNU findutils)  
+
+---
+
+Конфигурация и адаптация под конкретные директории выполняется вручную.
 
